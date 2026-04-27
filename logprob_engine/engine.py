@@ -58,8 +58,55 @@ def _resolve_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return _DTYPE_MAP[key]
 
 
+def _compute_logits(model, input_ids, attention_mask, shifted_loss_mask):
+    hidden_states = model.model.forward(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    ).last_hidden_state[:, :-1][shifted_loss_mask]
+    return model.lm_head(hidden_states)
+
+def _vocab_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    logprobs = F.log_softmax(logits, dim=-1)
+    return logprobs.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+
+def _vocab_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    logprobs = F.log_softmax(logits.float(), dim=-1)
+    return logprobs.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+
+def _token_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    logits = -F.cross_entropy(
+        logits, flat_labels, reduction="none"
+    )
+    return logits.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+
+def _token_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    logits = -F.cross_entropy(
+        logits.float(), flat_labels, reduction="none"
+    )
+    return logits.split(shifted_loss_mask.sum(-1).tolist(), dim=0) 
+
+def _seq_ce_loss(logps, labels, lengths):
+    return torch.segment_reduce(F.cross_entropy(logps, labels, reduction='none'), lengths=lengths, reduce='sum')
+
+def _seq_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    return -_seq_ce_loss(logits, flat_labels, shifted_loss_mask.sum(-1))
+
+def _seq_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    return -_seq_ce_loss(logits.float(), flat_labels, shifted_loss_mask.sum(-1))
+
+  
+
+
+
 class LogprobEngine:
-    """Loads a causal LM and computes per-token log-probabilities of supplied outputs."""
+    """Loads a causal LM and computes per-vocab/token/sequence log-probabilities of supplied outputs."""
 
     def __init__(
         self,
@@ -70,6 +117,8 @@ class LogprobEngine:
         device: str | torch.device | None = None,
         compile: bool = True,
         low_cpu_mem_usage: bool = True,
+        logprob_level: str = "token",
+        logprob_dtype: str | torch.dtype = "float32",
     ) -> None:
         torch_dtype = _resolve_dtype(dtype)
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path)
@@ -89,6 +138,8 @@ class LogprobEngine:
             torch_dtype=torch_dtype,
             device=device,
             compile=compile,
+            logprob_level=logprob_level,
+            logprob_dtype=logprob_dtype,
         )
 
     @classmethod
@@ -100,6 +151,8 @@ class LogprobEngine:
         model_name: str = "<custom>",
         device: str | torch.device | None = None,
         compile: bool = True,
+        logprob_level: str = "token",
+        logprob_dtype: str | torch.dtype = "float32",
     ) -> "LogprobEngine":
         """Build an engine from an already-loaded model and tokenizer.
 
@@ -118,6 +171,8 @@ class LogprobEngine:
             torch_dtype=torch_dtype,
             device=device,
             compile=compile,
+            logprob_level=logprob_level,
+            logprob_dtype=logprob_dtype,
         )
         return self
 
@@ -130,9 +185,13 @@ class LogprobEngine:
         torch_dtype: torch.dtype,
         device: str | torch.device | None,
         compile: bool,
+        logprob_level: str,
+        logprob_dtype: str | torch.dtype,
     ) -> None:
         self.model_name_or_path = model_name
         self.torch_dtype = torch_dtype
+        self.logprob_level = logprob_level
+        self.logprob_dtype = _resolve_dtype(logprob_dtype)
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -148,17 +207,16 @@ class LogprobEngine:
         _disable_dropout(model)
         model.to(self.device)
         model.eval()
-
-        def custom_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
-            hidden_states = model.model.forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            ).last_hidden_state[:, :-1][shifted_loss_mask]
-            logits = -F.cross_entropy(
-                model.lm_head(hidden_states).float(), flat_labels, reduction="none"
-            )
-            return logits.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+        
+        upcast_logprob = self.logprob_dtype in (torch.float32, "float32", "fp32") and self.torch_dtype in (torch.float16, "float16", "fp16", torch.bfloat16, "bfloat16", "bf16")
+        if self.logprob_level == "vocab":
+            custom_forward = _vocab_logprob_forward_fp32 if upcast_logprob else _vocab_logprob_forward
+        elif self.logprob_level == "token":
+            custom_forward = _token_logprob_forward_fp32 if upcast_logprob else _token_logprob_forward
+        elif self.logprob_level == "seq":
+            custom_forward = _seq_logprob_forward_fp32 if upcast_logprob else _seq_logprob_forward
+        else:
+            raise ValueError(f"Unsupported logprob_level: {self.logprob_level!r}. Choose one of 'vocab', 'token', or 'seq'.")
 
         if compile:
             custom_forward = torch.compile(custom_forward, dynamic=True)
@@ -202,13 +260,12 @@ class LogprobEngine:
         attention_mask = attention_mask.to(self.device)
         labels = labels.to(self.device)
         loss_mask = loss_mask.to(self.device)
-        with torch.no_grad():
-            logits = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                flat_labels=labels,
-                shifted_loss_mask=loss_mask,
-            )
+        logits = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            flat_labels=labels,
+            shifted_loss_mask=loss_mask,
+        )
         return list(logits), indices
 
     def _retry_by_halving(self, batch):
@@ -226,7 +283,7 @@ class LogprobEngine:
             return left + right, left_idx + right_idx
 
     # --------------------------- public API --------------------------- #
-
+    @torch.inference_mode()
     def process(self, items: Sequence[Item | dict]) -> list[list[float]]:
         """Return per-token logprobs for each item's ``output_ids``.
 
