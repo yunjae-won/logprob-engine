@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
@@ -68,27 +69,23 @@ def _compute_logits(model, input_ids, attention_mask, shifted_loss_mask):
 
 def _vocab_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
-    logprobs = F.log_softmax(logits, dim=-1)
-    return logprobs.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+    return F.log_softmax(logits, dim=-1)
 
 def _vocab_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
-    logprobs = F.log_softmax(logits.float(), dim=-1)
-    return logprobs.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
+    return F.log_softmax(logits.float(), dim=-1)
 
 def _token_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
-    logits = -F.cross_entropy(
+    return -F.cross_entropy(
         logits, flat_labels, reduction="none"
     )
-    return logits.split(shifted_loss_mask.sum(-1).tolist(), dim=0)
 
 def _token_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
-    logits = -F.cross_entropy(
+    return -F.cross_entropy(
         logits.float(), flat_labels, reduction="none"
     )
-    return logits.split(shifted_loss_mask.sum(-1).tolist(), dim=0) 
 
 def _seq_ce_loss(logps, labels, lengths):
     return torch.segment_reduce(F.cross_entropy(logps, labels, reduction='none'), lengths=lengths, reduce='sum')
@@ -101,7 +98,14 @@ def _seq_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, shi
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
     return -_seq_ce_loss(logits.float(), flat_labels, shifted_loss_mask.sum(-1))
 
-  
+
+def _numpy_dtype_for(torch_dtype: torch.dtype) -> np.dtype:
+    if torch_dtype == torch.float16:
+        return np.dtype(np.float16)
+    # NumPy has no native bfloat16 in the standard install. Return float32 for
+    # stable downstream arithmetic and for the JSON compatibility path.
+    return np.dtype(np.float32)
+
 
 
 
@@ -192,6 +196,7 @@ class LogprobEngine:
         self.torch_dtype = torch_dtype
         self.logprob_level = logprob_level
         self.logprob_dtype = _resolve_dtype(logprob_dtype)
+        self.numpy_logprob_dtype = _numpy_dtype_for(self.logprob_dtype)
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -266,7 +271,10 @@ class LogprobEngine:
             flat_labels=labels,
             shifted_loss_mask=loss_mask,
         )
-        return list(logits), indices
+        if self.logprob_level == "seq":
+            return list(logits.unbind(dim=0)), indices
+        lengths = loss_mask.sum(-1).tolist()
+        return list(logits.split(lengths, dim=0)), indices
 
     def _retry_by_halving(self, batch):
         try:
@@ -284,11 +292,12 @@ class LogprobEngine:
 
     # --------------------------- public API --------------------------- #
     @torch.inference_mode()
-    def process(self, items: Sequence[Item | dict]) -> list[list[float]]:
-        """Return per-token logprobs for each item's ``output_ids``.
+    def process_tensors(self, items: Sequence[Item | dict]) -> list[torch.Tensor]:
+        """Return per-item logprob tensors without Python-list serialization.
 
         Output[i] has length ``len(items[i].output_ids)`` and each value is
-        ``log p(output_ids[t] | prompt_ids, output_ids[:t])``.
+        ``log p(output_ids[t] | prompt_ids, output_ids[:t])`` for token/seq
+        modes, or shape ``[output_len, vocab]`` for vocab mode.
         """
         records = []
         for it in items:
@@ -306,5 +315,17 @@ class LogprobEngine:
 
         ordered = [None] * len(items)
         for idx, tensor in zip(indices, logits):
-            ordered[idx] = tensor.detach().to("cpu", dtype=torch.float32).tolist()
+            ordered[idx] = tensor.detach()
         return ordered  # type: ignore[return-value]
+
+    @torch.inference_mode()
+    def process_arrays(self, items: Sequence[Item | dict]) -> list[np.ndarray]:
+        """Return CPU NumPy arrays, avoiding the expensive tensor -> list path."""
+        tensors = self.process_tensors(items)
+        cpu_dtype = torch.float16 if self.numpy_logprob_dtype == np.dtype(np.float16) else torch.float32
+        return [tensor.to("cpu", dtype=cpu_dtype).numpy() for tensor in tensors]
+
+    @torch.inference_mode()
+    def process(self, items: Sequence[Item | dict]) -> list[list[float]]:
+        """Return logprobs as Python lists for JSON/backward compatibility."""
+        return [arr.astype(np.float32, copy=False).tolist() for arr in self.process_arrays(items)]

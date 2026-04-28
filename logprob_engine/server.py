@@ -1,12 +1,14 @@
 """FastAPI application exposing :class:`LogprobEngine` over HTTP.
 
-This server assumes a *single client* — handlers are plain synchronous
-functions and there is no locking or request queueing.
+The server serializes model forward calls with a process-local lock. This
+keeps one reward GPU from receiving overlapping full-vocab requests from
+multiple training ranks.
 """
 
 from __future__ import annotations
 
 import io
+import threading
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -21,6 +23,7 @@ from .schemas import (
 
 
 def create_app(engine: LogprobEngine) -> FastAPI:
+    engine_lock = threading.Lock()
     app = FastAPI(
         title="logprob-engine",
         version="0.1.0",
@@ -52,11 +55,12 @@ def create_app(engine: LogprobEngine) -> FastAPI:
     @app.post("/v1/logprobs")
     def logprobs(
         request: LogprobRequest,
-        format: str = Query("json", pattern="^(json|npz)$"),
+        format: str = Query("json", pattern="^(json|npz|npz_compressed)$"),
     ):
         items = [it.model_dump() for it in request.items]
         try:
-            result = engine.process(items)
+            with engine_lock:
+                result = engine.process(items) if format == "json" else engine.process_arrays(items)
         except RuntimeError as e:
             # The engine raises RuntimeError when even a single item OOMs.
             raise HTTPException(status_code=413, detail=str(e)) from e
@@ -64,13 +68,15 @@ def create_app(engine: LogprobEngine) -> FastAPI:
         if format == "json":
             return LogprobResponse(logprobs=result)
 
-        # ``savez_compressed`` with one named array per item preserves the
-        # ragged shape without forcing a Python-side concatenation.
+        # One named array per item preserves ragged sequence lengths without
+        # forcing a Python-side concatenation. Uncompressed NPZ is the default
+        # fast path; compression is CPU-heavy for dense full-vocab logprobs.
         buf = io.BytesIO()
-        np.savez_compressed(
-            buf,
-            **{f"item_{i}": np.asarray(lp, dtype=np.float32) for i, lp in enumerate(result)},
-        )
+        arrays = {f"item_{i}": np.asarray(lp) for i, lp in enumerate(result)}
+        if format == "npz_compressed":
+            np.savez_compressed(buf, **arrays)
+        else:
+            np.savez(buf, **arrays)
         return Response(content=buf.getvalue(), media_type="application/octet-stream")
 
     return app

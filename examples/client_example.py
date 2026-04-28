@@ -42,6 +42,9 @@ def main() -> None:
     total = sum(logprobs[0])
     print(f"sum logprob: {total:.3f}  (joint p = {math.exp(total):.3e})")
 
+    arrays = client.logprob_arrays(items, format="npz")
+    print("binary array shape:", arrays[0].shape)
+
 
 if __name__ == "__main__":
     main()

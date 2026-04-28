@@ -1,14 +1,17 @@
 # logprob-engine
 
-A small, single-GPU HTTP server that returns **token-level log-probabilities**
-under a Hugging Face causal language model. You send `(prompt_ids, output_ids)`
-pairs; you get back, for each pair, the per-token log-probability of every
-output token under the model.
+A small, single-GPU HTTP server that returns **token**, **sequence**, or
+**full-vocab** log-probabilities under a Hugging Face causal language model.
+You send `(prompt_ids, output_ids)` pairs; you get back either the sampled-token
+log-probs, the summed sequence log-prob, or a `[output_len, vocab]` tensor for
+each pair.
 
 It is intentionally simple:
 
-- one model, one GPU, one client at a time;
+- one model, one GPU, serialized model forwards;
 - the HTTP layer is a thin shell around a `LogprobEngine` class;
+- `torch.compile` friendly dense forwards, with ragged splitting outside the
+  compiled graph;
 - batches that don't fit are recursively halved until they do.
 
 ## Install
@@ -37,6 +40,8 @@ Useful flags:
 | `--dtype`         | `bfloat16` (default), `float16`, `float32` |
 | `--attn`          | e.g. `flash_attention_2`, `sdpa` |
 | `--device`        | `cuda`, `cuda:0`, `cpu`; auto-detected by default |
+| `--logprob-level` | `token` (default), `seq`, or `vocab` |
+| `--logprob-dtype` | `float32` (default), `bfloat16`, or `float16` |
 | `--no-compile`    | disable `torch.compile` (useful while debugging) |
 
 ## API
@@ -62,8 +67,10 @@ Response (default `?format=json`):
 `logprobs[i]` is the same length as `items[i].output_ids`, and each entry is
 `log p(output_ids[t] | prompt_ids, output_ids[:t])`.
 
-For long outputs, request `?format=npz` to receive a compressed numpy archive
-(`application/octet-stream`) with one `item_<i>` array per item.
+For long outputs or full-vocab mode, request `?format=npz` to receive an
+uncompressed NumPy archive (`application/octet-stream`) with one `item_<i>`
+array per item. `?format=npz_compressed` is also available, but compression is
+usually CPU-bound and slow for dense full-vocab log-probs.
 
 ### Other endpoints
 
@@ -89,8 +96,10 @@ items = [{
     "output_ids": tok.encode(" Paris.",                  add_special_tokens=False),
 }]
 
-logprobs = client.logprobs(items)            # JSON
-# logprobs = client.logprobs(items, format="npz")  # compressed numpy
+logprobs = client.logprobs(items)  # JSON/list compatibility path
+
+# Fast binary path; returns NumPy arrays directly.
+arrays = client.logprob_arrays(items, format="npz")
 ```
 
 ## curl
@@ -103,11 +112,15 @@ curl -s http://127.0.0.1:8000/v1/logprobs \
 
 ## Notes
 
-- **Single-GPU, single-client.** No request queueing, no cross-request
-  batching, no multi-worker uvicorn. If you need any of that, this isn't the
-  right tool.
+- **Single-GPU, serialized forwards.** The server uses a process-local lock
+  around model execution so concurrent clients do not overlap full-vocab
+  requests on one GPU. There is no cross-request batching or multi-worker
+  uvicorn.
 - **Tokenization.** Clients are responsible for tokenization. Use the same
   model name as the server (returned by `/v1/info`) so token IDs line up.
+- **Vocab-level speed path.** Prefer `format=npz` plus
+  `LogprobClient.logprob_arrays(...)`; this avoids Python-list inflation for
+  large `[tokens, vocab]` payloads.
 - **OOM behaviour.** When a batch OOMs, the engine catches it, empties the
   CUDA cache, and retries the two halves recursively. If a single item OOMs
   the server returns `413 Payload Too Large`.

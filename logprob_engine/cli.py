@@ -32,6 +32,18 @@ def _build_serve_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentPar
         default=None,
         help="Force device (e.g. 'cuda', 'cuda:0', 'cpu'). Defaults to cuda if available.",
     )
+    p.add_argument(
+        "--logprob-level",
+        default="token",
+        choices=["token", "seq", "vocab"],
+        help="Return token logprobs, sequence logprobs, or full-vocab logprobs.",
+    )
+    p.add_argument(
+        "--logprob-dtype",
+        default="float32",
+        choices=["float32", "bfloat16", "float16"],
+        help="Compute/return logprob dtype. bfloat16 is returned as float32 over NumPy.",
+    )
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile.")
     p.add_argument("--log-level", default="info")
     return p
@@ -50,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
             attn_implementation=args.attn,
             device=args.device,
             compile=not args.no_compile,
+            logprob_level=args.logprob_level,
+            logprob_dtype=args.logprob_dtype,
         )
         app = create_app(engine)
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

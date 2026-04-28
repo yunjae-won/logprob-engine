@@ -25,11 +25,32 @@ class LogprobClient:
     ) -> list[list[float]]:
         """Score each ``{prompt_ids, output_ids}`` item.
 
-        ``format="npz"`` requests a compressed binary response and decodes it
-        back into a Python list — useful when output sequences are long.
+        ``format="npz"`` requests a binary response. Use
+        :meth:`logprob_arrays` when the caller can consume NumPy arrays
+        directly; this compatibility wrapper converts back to Python lists.
         """
-        if format not in ("json", "npz"):
-            raise ValueError(f"format must be 'json' or 'npz', got {format!r}")
+        if format == "json":
+            items = [dict(it) for it in items]
+            resp = self.session.post(
+                f"{self.base_url}/v1/logprobs",
+                json={"items": items},
+                params={"format": format},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()["logprobs"]
+
+        return [arr.astype(np.float32, copy=False).tolist() for arr in self.logprob_arrays(items, format=format)]
+
+    def logprob_arrays(
+        self,
+        items: Iterable[Mapping[str, list[int]]],
+        *,
+        format: str = "npz",
+    ) -> list[np.ndarray]:
+        """Score items and return NumPy arrays without Python-list inflation."""
+        if format not in ("npz", "npz_compressed"):
+            raise ValueError(f"format must be 'npz' or 'npz_compressed', got {format!r}")
         items = [dict(it) for it in items]
         resp = self.session.post(
             f"{self.base_url}/v1/logprobs",
@@ -39,11 +60,8 @@ class LogprobClient:
         )
         resp.raise_for_status()
 
-        if format == "json":
-            return resp.json()["logprobs"]
-
         with np.load(io.BytesIO(resp.content)) as npz:
-            return [npz[f"item_{i}"].tolist() for i in range(len(items))]
+            return [npz[f"item_{i}"] for i in range(len(items))]
 
     # --------------------------- helpers --------------------------- #
 

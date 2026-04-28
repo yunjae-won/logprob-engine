@@ -1,6 +1,6 @@
 """Smoke tests that run on CPU without any HF Hub downloads.
 
-We construct a tiny LLaMA from scratch and a stub tokenizer, then exercise
+We construct a tiny causal LM from scratch and a stub tokenizer, then exercise
 the engine and the HTTP layer end-to-end.
 """
 
@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import io
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 from fastapi.testclient import TestClient
-from transformers import LlamaConfig, LlamaForCausalLM
 
 from logprob_engine import LogprobEngine, create_app
 
@@ -34,20 +34,27 @@ class StubTokenizer:
         return ids
 
 
+class TinyBody(torch.nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+
+    def forward(self, input_ids, attention_mask=None, use_cache=False):
+        del attention_mask, use_cache
+        return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+
+class TinyCausalLM(torch.nn.Module):
+    def __init__(self, vocab_size: int = VOCAB, hidden_size: int = 16) -> None:
+        super().__init__()
+        self.model = TinyBody(vocab_size, hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+        self.config = SimpleNamespace(vocab_size=vocab_size)
+
+
 def _build_engine(*, compile: bool = False) -> LogprobEngine:
     torch.manual_seed(0)
-    config = LlamaConfig(
-        vocab_size=VOCAB,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        pad_token_id=PAD_ID,
-        eos_token_id=EOS_ID,
-    )
-    model = LlamaForCausalLM(config)
+    model = TinyCausalLM()
     return LogprobEngine.from_components(
         model,
         StubTokenizer(),
