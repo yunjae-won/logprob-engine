@@ -41,6 +41,9 @@ def create_app(engine: LogprobEngine) -> FastAPI:
             dtype=str(engine.torch_dtype).replace("torch.", ""),
             device=str(engine.device),
             vocab_size=engine.vocab_size,
+            logprob_level=engine.logprob_level,
+            top_k=engine.top_k,
+            top_k_include_outputs=engine.top_k_include_outputs,
         )
 
     @app.get("/v1/tokenize", response_model=TokenizeResponse)

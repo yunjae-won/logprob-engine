@@ -35,8 +35,22 @@ def _build_serve_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentPar
     p.add_argument(
         "--logprob-level",
         default="token",
-        choices=["token", "seq", "vocab"],
-        help="Return token logprobs, sequence logprobs, or full-vocab logprobs.",
+        choices=["token", "seq", "vocab", "topk"],
+        help="Return token, sequence, dense full-vocab, or compact top-k vocab logprobs.",
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help=(
+            "Return compact top-k vocab logprobs. Use with --logprob-level vocab/topk. "
+            "With the default label-inclusive mode, --top-k 1 aliases token logprobs."
+        ),
+    )
+    p.add_argument(
+        "--no-top-k-include-output",
+        action="store_true",
+        help="Do not force each sampled output token into compact top-k results.",
     )
     p.add_argument(
         "--logprob-dtype",
@@ -64,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
             compile=not args.no_compile,
             logprob_level=args.logprob_level,
             logprob_dtype=args.logprob_dtype,
+            top_k=args.top_k,
+            top_k_include_outputs=not args.no_top_k_include_output,
         )
         app = create_app(engine)
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

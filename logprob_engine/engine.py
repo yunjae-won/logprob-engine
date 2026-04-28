@@ -15,6 +15,7 @@ The compute path matches the structure of the original skeleton:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from types import MethodType
 from typing import Sequence
 
@@ -75,6 +76,39 @@ def _vocab_logprob_forward_fp32(model, input_ids, attention_mask, flat_labels, s
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
     return F.log_softmax(logits.float(), dim=-1)
 
+
+def _topk_logprob_forward(
+    model,
+    input_ids,
+    attention_mask,
+    flat_labels,
+    shifted_loss_mask,
+    *,
+    top_k: int,
+    include_labels: bool,
+    upcast: bool,
+):
+    logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
+    if upcast:
+        logits = logits.float()
+
+    k = min(int(top_k), logits.shape[-1])
+    log_denominator = torch.logsumexp(logits, dim=-1, keepdim=True)
+
+    top_values, top_indices = torch.topk(logits, k=k, dim=-1)
+    if include_labels:
+        label_values = logits.gather(1, flat_labels[:, None])
+        has_label = (top_indices == flat_labels[:, None]).any(dim=-1, keepdim=True)
+        top_values = top_values.clone()
+        top_indices = top_indices.clone()
+        top_values[:, -1:] = torch.where(has_label, top_values[:, -1:], label_values)
+        top_indices[:, -1:] = torch.where(has_label, top_indices[:, -1:], flat_labels[:, None])
+        top_values, order = top_values.sort(dim=-1, descending=True)
+        top_indices = top_indices.gather(1, order)
+
+    top_logprobs = top_values - log_denominator
+    return torch.stack([top_indices.to(dtype=top_logprobs.dtype), top_logprobs], dim=-1)
+
 def _token_logprob_forward(model, input_ids, attention_mask, flat_labels, shifted_loss_mask):
     logits = _compute_logits(model, input_ids, attention_mask, shifted_loss_mask)
     return -F.cross_entropy(
@@ -123,6 +157,8 @@ class LogprobEngine:
         low_cpu_mem_usage: bool = True,
         logprob_level: str = "token",
         logprob_dtype: str | torch.dtype = "float32",
+        top_k: int | None = None,
+        top_k_include_outputs: bool = True,
     ) -> None:
         torch_dtype = _resolve_dtype(dtype)
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path)
@@ -144,6 +180,8 @@ class LogprobEngine:
             compile=compile,
             logprob_level=logprob_level,
             logprob_dtype=logprob_dtype,
+            top_k=top_k,
+            top_k_include_outputs=top_k_include_outputs,
         )
 
     @classmethod
@@ -157,6 +195,8 @@ class LogprobEngine:
         compile: bool = True,
         logprob_level: str = "token",
         logprob_dtype: str | torch.dtype = "float32",
+        top_k: int | None = None,
+        top_k_include_outputs: bool = True,
     ) -> "LogprobEngine":
         """Build an engine from an already-loaded model and tokenizer.
 
@@ -177,6 +217,8 @@ class LogprobEngine:
             compile=compile,
             logprob_level=logprob_level,
             logprob_dtype=logprob_dtype,
+            top_k=top_k,
+            top_k_include_outputs=top_k_include_outputs,
         )
         return self
 
@@ -191,12 +233,18 @@ class LogprobEngine:
         compile: bool,
         logprob_level: str,
         logprob_dtype: str | torch.dtype,
+        top_k: int | None,
+        top_k_include_outputs: bool,
     ) -> None:
         self.model_name_or_path = model_name
         self.torch_dtype = torch_dtype
+        requested_logprob_level = logprob_level
         self.logprob_level = logprob_level
         self.logprob_dtype = _resolve_dtype(logprob_dtype)
         self.numpy_logprob_dtype = _numpy_dtype_for(self.logprob_dtype)
+        self.top_k = top_k
+        self.top_k_include_outputs = bool(top_k_include_outputs)
+        self._returns_topk_pairs = False
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -213,15 +261,37 @@ class LogprobEngine:
         model.to(self.device)
         model.eval()
         
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k!r}.")
+        if self.logprob_level == "topk":
+            if top_k is None:
+                raise ValueError("logprob_level='topk' requires top_k to be set.")
+        elif top_k is not None and self.logprob_level != "vocab":
+            raise ValueError("top_k is only supported with logprob_level='vocab' or 'topk'.")
+
         upcast_logprob = self.logprob_dtype in (torch.float32, "float32", "fp32") and self.torch_dtype in (torch.float16, "float16", "fp16", torch.bfloat16, "bfloat16", "bf16")
-        if self.logprob_level == "vocab":
+        if top_k == 1 and self.top_k_include_outputs:
+            self.logprob_level = "token"
+            custom_forward = _token_logprob_forward_fp32 if upcast_logprob else _token_logprob_forward
+        elif self.logprob_level == "topk" or (self.logprob_level == "vocab" and top_k is not None):
+            self.logprob_level = "topk"
+            self._returns_topk_pairs = True
+            custom_forward = partial(
+                _topk_logprob_forward,
+                top_k=int(top_k),  # type: ignore[arg-type]
+                include_labels=self.top_k_include_outputs,
+                upcast=upcast_logprob,
+            )
+        elif self.logprob_level == "vocab":
             custom_forward = _vocab_logprob_forward_fp32 if upcast_logprob else _vocab_logprob_forward
         elif self.logprob_level == "token":
             custom_forward = _token_logprob_forward_fp32 if upcast_logprob else _token_logprob_forward
         elif self.logprob_level == "seq":
             custom_forward = _seq_logprob_forward_fp32 if upcast_logprob else _seq_logprob_forward
         else:
-            raise ValueError(f"Unsupported logprob_level: {self.logprob_level!r}. Choose one of 'vocab', 'token', or 'seq'.")
+            raise ValueError(
+                f"Unsupported logprob_level: {requested_logprob_level!r}. Choose one of 'vocab', 'topk', 'token', or 'seq'."
+            )
 
         if compile:
             custom_forward = torch.compile(custom_forward, dynamic=True)
@@ -297,7 +367,9 @@ class LogprobEngine:
 
         Output[i] has length ``len(items[i].output_ids)`` and each value is
         ``log p(output_ids[t] | prompt_ids, output_ids[:t])`` for token/seq
-        modes, or shape ``[output_len, vocab]`` for vocab mode.
+        modes, shape ``[output_len, vocab]`` for vocab mode, or
+        ``[output_len, top_k, 2]`` for top-k mode where the final dimension is
+        ``(token_id, logprob)``.
         """
         records = []
         for it in items:
@@ -322,6 +394,8 @@ class LogprobEngine:
     def process_arrays(self, items: Sequence[Item | dict]) -> list[np.ndarray]:
         """Return CPU NumPy arrays, avoiding the expensive tensor -> list path."""
         tensors = self.process_tensors(items)
+        if self._returns_topk_pairs:
+            return [tensor.to("cpu", dtype=torch.float32).numpy() for tensor in tensors]
         cpu_dtype = torch.float16 if self.numpy_logprob_dtype == np.dtype(np.float16) else torch.float32
         return [tensor.to("cpu", dtype=cpu_dtype).numpy() for tensor in tensors]
 

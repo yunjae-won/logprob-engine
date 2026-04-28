@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -19,7 +21,7 @@ class LogprobRequest(BaseModel):
 class LogprobResponse(BaseModel):
     """``logprobs[i]`` is parallel to ``request.items[i].output_ids``."""
 
-    logprobs: list[list[float]]
+    logprobs: list[Any]
 
 
 class InfoResponse(BaseModel):
@@ -27,6 +29,9 @@ class InfoResponse(BaseModel):
     dtype: str
     device: str
     vocab_size: int
+    logprob_level: str
+    top_k: int | None = None
+    top_k_include_outputs: bool = True
 
 
 class TokenizeResponse(BaseModel):

@@ -9,6 +9,14 @@ import numpy as np
 import requests
 
 
+def unpack_topk_array(array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split a packed ``[tokens, k, 2]`` top-k array into ids and logprobs."""
+
+    if array.ndim != 3 or array.shape[-1] != 2:
+        raise ValueError(f"Expected a packed top-k array with shape [tokens, k, 2], got {array.shape}.")
+    return array[..., 0].astype(np.int64, copy=False), array[..., 1]
+
+
 class LogprobClient:
     def __init__(self, base_url: str, *, timeout: float = 600.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -62,6 +70,16 @@ class LogprobClient:
 
         with np.load(io.BytesIO(resp.content)) as npz:
             return [npz[f"item_{i}"] for i in range(len(items))]
+
+    def logprob_topk_arrays(
+        self,
+        items: Iterable[Mapping[str, list[int]]],
+        *,
+        format: str = "npz",
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Score items from a top-k server and return ``(token_ids, logprobs)`` arrays."""
+
+        return [unpack_topk_array(array) for array in self.logprob_arrays(items, format=format)]
 
     # --------------------------- helpers --------------------------- #
 
